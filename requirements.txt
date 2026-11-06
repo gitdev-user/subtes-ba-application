@@ -1,0 +1,7 @@
+geopandas
+duckdb
+pandas
+polars
+pyarrow
+dash
+plotly
