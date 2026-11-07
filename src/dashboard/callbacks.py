@@ -1,7 +1,8 @@
-"""Presentación y filtros del dashboard estratégico de nueve gráficos."""
+﻿"""Presentación y filtros de los gráficos generales del dashboard."""
 
 from dataclasses import replace
 from functools import lru_cache
+from threading import RLock
 import logging
 
 import duckdb
@@ -10,7 +11,7 @@ import plotly.graph_objects as go
 from dash import Input, Output, html
 
 from src.dashboard.queries import (
-    CATEGORIAS, VALIDACIONES, DIAS_RANKING, GRUPO_FERROVIARIO, GRUPO_RESTO,
+    CATEGORIAS, VALIDACIONES, DIAS_RANKING,
     Filtros, consultar_dashboard, consultar_evolucion, consultar_kpis, validar_filtros,
 )
 
@@ -154,24 +155,14 @@ def barras_validaciones(datos, nivel, seleccion=None):
     return fig
 
 
-def torta_ferroviaria(indicadores):
-    total = indicadores["total"]
-    if pd.isna(total) or total <= 0:
-        return figura_vacia("No hay ingresos positivos para calcular participaciones")
-    ferroviario = indicadores["total_ferroviario"]
-    ferroviario = 0 if pd.isna(ferroviario) else ferroviario
-    fig = go.Figure(go.Pie(
-        labels=[GRUPO_FERROVIARIO, GRUPO_RESTO], values=[ferroviario, total - ferroviario],
-        marker={"colors": ["#247aff", "#7d91af"], "line": {"color": "white", "width": 2}},
-        sort=False, hole=0, textinfo="percent", textposition="inside",
-        hovertemplate="%{label}<br>Ingresos: %{value:,.0f}<br>%{percent}<extra></extra>",
-    ))
-    return estilizar(fig)
-
-
 def _limites(catalogos, filtros):
     anios = [filtros.anio] if filtros.anio is not None else catalogos["anios"]
-    return pd.Timestamp(f"{min(anios)}-01-01"), pd.Timestamp(f"{max(anios)}-12-31")
+    inicio, fin = pd.Timestamp(f"{min(anios)}-01-01"), pd.Timestamp(f"{max(anios)}-12-31")
+    if filtros.fecha_desde:
+        inicio = max(inicio, pd.Timestamp(filtros.fecha_desde))
+    if filtros.fecha_hasta:
+        fin = min(fin, pd.Timestamp(filtros.fecha_hasta))
+    return inicio, fin
 
 
 def temporal(datos, vista, catalogos, filtros, area=False):
@@ -190,7 +181,7 @@ def temporal(datos, vista, catalogos, filtros, area=False):
         elif vista == "semanal":
             eje = pd.date_range(inicio - pd.Timedelta(days=inicio.weekday()), fin, freq="W-MON")
         else:
-            eje = pd.date_range(inicio, fin, freq="MS")
+            eje = pd.date_range(inicio.replace(day=1), fin, freq="MS")
     data = data.set_index("eje").reindex(eje)
     valores = data["promedio" if promedio else "total"]
     escala, titulo = _escala(valores)
@@ -210,7 +201,7 @@ def temporal(datos, vista, catalogos, filtros, area=False):
         fig.update_xaxes(tickvals=list(eje), ticktext=["Verano", "Otoño", "Invierno", "Primavera"])
     elif vista == "mensual":
         if inicio.year == fin.year:
-            fig.update_xaxes(tickvals=list(eje), ticktext=MESES)
+            fig.update_xaxes(tickvals=list(eje), ticktext=[MESES[fecha.month - 1] for fecha in eje])
         else:
             anos = pd.date_range(inicio, fin, freq="YS")
             fig.update_xaxes(tickvals=anos, ticktext=[str(a.year) for a in anos])
@@ -243,33 +234,6 @@ def mapa_calor(datos, categoria="todas"):
                      range=[-0.5, 23.5], showgrid=False)
     fig.update_yaxes(title="Día de la semana", categoryorder="array", categoryarray=dias,
                      autorange="reversed", showgrid=False)
-    return fig
-
-
-def perfil_horario(datos, dias="todos"):
-    if dias not in DIAS_RANKING:
-        raise ValueError("El tipo de día del perfil horario no es válido.")
-    data = datos.copy()
-    if dias != "todos":
-        data["total"] = data["total_" + dias]
-    if data.empty or not data["total"].notna().any():
-        return figura_vacia("No hay registros para el tipo de día y los filtros aplicados")
-    escala, titulo = _escala(data["total"])
-    eje = list(range(24))
-    fig = go.Figure()
-    for categoria in CATEGORIAS:
-        filas = data.loc[data["categoria"] == categoria]
-        if filas.empty or not filas["total"].notna().any():
-            continue
-        valores = filas.set_index("eje")["total"].reindex(eje)
-        fig.add_scatter(x=eje, y=valores / escala, mode="lines", connectgaps=False,
-                        name=ETIQUETAS_CATEGORIA[categoria], line={"color": COLORES_CATEGORIA[categoria], "width": 2},
-                        customdata=valores, hovertemplate="%{x}:00<br>Ingresos: %{customdata:,.0f}<extra>%{fullData.name}</extra>")
-    fig = estilizar(fig)
-    ticks = list(range(0, 24, 3))
-    fig.update_xaxes(tickvals=ticks, ticktext=[f"{t:02d}:00" for t in ticks], title="Hora del día", range=[0, 23])
-    fig.update_yaxes(title=titulo, rangemode="tozero")
-    fig.update_layout(margin={"b": 110})
     return fig
 
 
@@ -309,48 +273,18 @@ def tarjetas_kpi(fila):
     total = fila["total"]
     dias = fila["dias_conocidos"]
     ferro = fila["total_ferroviario"]
+    habiles = fila["total_habiles"]
+    participacion_habil = habiles / total * 100 if pd.notna(habiles) and pd.notna(total) and total > 0 else None
     participacion = (0 if pd.isna(ferro) else ferro) / total * 100 if pd.notna(total) and total > 0 else None
     cards = [("Ingresos totales", abreviar(total), "Acumulado histórico · 2014–2021"),
              ("Promedio diario", numero(total / dias) if dias else "Sin dato", "Por día con datos · histórico"),
-             ("Estaciones observadas", numero(fila["estaciones"]), "Con registros en todo el histórico"),
-             ("Participación ferroviaria", numero(participacion, 1) + " %" if participacion is not None else "Sin dato", "Ingresos en estaciones ferroviarias · histórico")]
+             ("Ingresos en días hábiles", numero(participacion_habil, 1) + " %" if participacion_habil is not None else "Sin dato", "Lunes a viernes sin feriados / total histórico · 2014–2021"),
+             ("Participación ferroviaria", numero(participacion, 1) + " %" if participacion is not None else "Sin dato", "Todos los días: hábiles, fines de semana y feriados · 2014–2021")]
     return [html.Div([html.Span(titulo, className="kpi-label"), html.Strong(valor, className="kpi-value"),
                       html.Small(detalle)], className=f"kpi-card kpi-{i}") for i, (titulo, valor, detalle) in enumerate(cards)]
 
 
-def renderizar(datos, filtros, catalogos, *, horario_dias="todos", mapa_categoria="todas", validaciones=None,
-               comunas_dias="todos", estaciones_dias="todos", ferroviario_dias="todos",
-               lineas_validaciones=None, categorias_validaciones=None):
-    if ferroviario_dias not in DIAS_RANKING:
-        raise ValueError("El tipo de día del gráfico ferroviario no es válido.")
-    fila = datos["indicadores"].iloc[0]
-    fila_pie = fila.copy()
-    if ferroviario_dias != "todos":
-        categorias = datos["totales"].loc[datos["totales"]["nivel"] == "categoria"]
-        ferroviarias = categorias.loc[categorias["etiqueta"] == "TRASBORDO FERROVIARIO"]
-        columna = "total_" + ferroviario_dias
-        fila_pie["total"] = categorias[columna].sum(min_count=1)
-        fila_pie["total_ferroviario"] = ferroviarias[columna].sum(min_count=1)
-    figura_composicion, altura = composicion(datos["composicion"], validaciones)
-    figuras = [temporal(datos["temporal"], "mensual", catalogos, filtros, area=True),
-               perfil_horario(datos["horario"], horario_dias),
-               mapa_calor(datos["temporal"], mapa_categoria),
-               barras_validaciones(datos["totales"], "linea", lineas_validaciones),
-               barras_validaciones(datos["totales"], "categoria", categorias_validaciones),
-               torta_ferroviaria(fila_pie), figura_composicion,
-               barras_totales(datos["totales"], "comuna", True, comunas_dias),
-               barras_totales(datos["totales"], "estacion", True, estaciones_dias)]
-    cobertura = f"Histórico · {numero(fila['estaciones'])} estaciones · {numero(fila['dias'])} días con registros."
-    return figuras, cobertura, altura
-
-
 def registrar_callbacks(app, repository, catalogos):
-    # Datos agregados en el servidor. Cambiar una vista no vuelve a leer el DW.
-    # Los filtros visibles son locales; el estado base comienza sin restricciones.
-    @lru_cache(maxsize=4)
-    def consultar(filtros, revision):
-        return consultar_dashboard(repository, filtros)
-
     @lru_cache(maxsize=1)
     def indicadores_globales(revision):
         return consultar_kpis(repository)
@@ -369,10 +303,11 @@ def registrar_callbacks(app, repository, catalogos):
         return consultar_evolucion(repository, filtros, dias, validacion)
 
     @app.callback(Output("grafico-01", "figure"), Output("mensaje-01", "children"),
-                  Input("filtros-aplicados", "data"), Input("evolucion-anio", "value"),
+                  Input("filtros-aplicados", "data"),
                   Input("evolucion-dias", "value"), Input("evolucion-linea", "value"),
-                  Input("evolucion-categoria", "value"), Input("evolucion-validacion", "value"))
-    def actualizar_evolucion(aplicados, anio, dias, linea, categoria, validacion):
+                  Input("evolucion-categoria", "value"), Input("evolucion-validacion", "value"),
+                  Input("evolucion-fechas", "start_date"), Input("evolucion-fechas", "end_date"))
+    def actualizar_evolucion(aplicados, dias, linea, categoria, validacion, desde, hasta):
         try:
             if not isinstance(validacion, str) or validacion not in ("todos", *VALIDACIONES):
                 raise ValueError("Seleccioná Todos o un único tipo de validación o pase.")
@@ -383,10 +318,11 @@ def registrar_callbacks(app, repository, catalogos):
             valores = dict(aplicados["filtros"])
             for clave in ("lineas", "estaciones", "categorias", "zonas", "comunas"):
                 valores[clave] = tuple(valores.get(clave, ()))
-            filtros = replace(Filtros(**valores), anio=None if anio == "todos" else anio,
+            filtros = replace(Filtros(**valores), anio=None,
                               lineas=() if linea == "todas" else (linea,),
                               categorias=() if categoria == "todas" else (categoria,),
-                              tipo_dia="todos", feriados="todos")
+                              tipo_dia="todos", feriados="todos",
+                              fecha_desde=desde or None, fecha_hasta=hasta or None)
             validar_filtros(filtros)
             datos = consultar_mensual(filtros, dias, validacion, aplicados["revision"])
             figura = temporal(datos, "mensual", {**catalogos, "anios": list(range(2014, 2022))}, filtros, area=True)
@@ -397,39 +333,60 @@ def registrar_callbacks(app, repository, catalogos):
             logger.exception("No se pudo consultar la evolución mensual")
             return figura_vacia(), "La base no está disponible. Reiniciá el dashboard para reintentar."
 
-    salidas = [Output("cobertura", "children"), Output("mensaje-consulta", "children")]
-    salidas += [Output(f"grafico-{i:02d}", "figure") for i in range(2, 10)]
-    salidas += [Output("frame-07", "style")]
+    # Una caché compartida evita repetir lecturas entre gráficos con la misma selección.
+    # El bloqueo evita consultas duplicadas cuando varios callbacks se inician a la vez.
+    consulta_lock = RLock()
 
-    @app.callback(salidas, Input("filtros-aplicados", "data"), Input("horario-dias", "value"),
-                  Input("mapa-categoria", "value"),
-                  Input("composicion-validaciones", "value"),
-                  Input("comunas-dias", "value"), Input("estaciones-dias", "value"), Input("ferroviario-dias", "value"),
-                  Input("lineas-validaciones", "value"), Input("categorias-validaciones", "value"))
-    def actualizar(aplicados, horario_dias, mapa_categoria, validaciones, comunas_dias, estaciones_dias, ferroviario_dias,
-                   lineas_validaciones, categorias_validaciones):
-        try:
-            if horario_dias not in DIAS_RANKING:
-                raise ValueError("El tipo de día del perfil horario no es válido.")
-            if mapa_categoria not in ("todas", *CATEGORIAS):
-                raise ValueError("La categoría del mapa de calor no es válida.")
-            if any(not isinstance(seleccion, list) or any(v not in VALIDACIONES for v in seleccion)
-                   for seleccion in (validaciones, lineas_validaciones, categorias_validaciones)):
-                raise ValueError("El tipo de validación seleccionado no es válido.")
-            valores = dict(aplicados["filtros"])
-            for clave in ("lineas", "estaciones", "categorias", "zonas", "comunas"):
-                valores[clave] = tuple(valores.get(clave, ()))
-            filtros = Filtros(**valores)
-            validar_filtros(filtros)
-            datos = consultar(filtros, aplicados["revision"])
-            figuras, cobertura, altura = renderizar(
-                datos, filtros, catalogos, horario_dias=horario_dias, mapa_categoria=mapa_categoria, validaciones=validaciones,
-                comunas_dias=comunas_dias, estaciones_dias=estaciones_dias, ferroviario_dias=ferroviario_dias,
-                lineas_validaciones=lineas_validaciones, categorias_validaciones=categorias_validaciones)
-        except ValueError as error:
-            return ["", str(error), *[figura_vacia() for _ in range(8)], {"height": "420px"}]
-        except duckdb.Error:
-            logger.exception("No se pudo consultar el dashboard")
-            return ["", "La base no está disponible. Cerrá otras conexiones y reiniciá el dashboard para reintentar.",
-                    *[figura_vacia() for _ in range(8)], {"height": "420px"}]
-        return [cobertura, "", *figuras[1:], {"height": f"{altura}px"}]
+    @lru_cache(maxsize=64)
+    def consultar_seccion(seccion, filtros):
+        return consultar_dashboard(repository, filtros, secciones=(seccion,))[seccion]
+
+    def registrar_grafico(numero, prefijo, seccion, controles):
+        salidas = [Output(f"grafico-{numero:02d}", "figure"), Output(f"mensaje-{numero:02d}", "children")]
+        if numero == 6:
+            salidas.append(Output("frame-06", "style"))
+
+        @app.callback(salidas, Input(f"{prefijo}-anio", "value"),
+                      *[Input(control, "value") for control in controles])
+        def actualizar(anio, *valores):
+            altura = 420
+            try:
+                dias = "todos" if numero == 3 else valores[0]
+                if dias not in DIAS_RANKING:
+                    raise ValueError("El tipo de día no es válido.")
+                if numero in (4, 5, 6) and (
+                    not isinstance(valores[1], list) or any(v not in VALIDACIONES for v in valores[1])
+                ):
+                    raise ValueError("El tipo de validación seleccionado no es válido.")
+                if numero == 3 and valores[0] not in ("todas", *CATEGORIAS):
+                    raise ValueError("La categoría seleccionada no es válida.")
+                filtros = Filtros(anio=None if anio == "todos" else anio,
+                                  tipo_dia=dias if numero in (4, 5, 6) else "todos")
+                validar_filtros(filtros)
+                with consulta_lock:
+                    datos = consultar_seccion(seccion, filtros)
+                if numero == 3:
+                    figura = mapa_calor(datos, valores[0])
+                elif numero in (4, 5):
+                    figura = barras_validaciones(datos, "linea" if numero == 4 else "categoria", valores[1])
+                elif numero == 6:
+                    figura, altura = composicion(datos, valores[1])
+                else:
+                    figura = barras_totales(datos, "comuna" if numero == 7 else "estacion", True, dias)
+                mensaje = ""
+            except ValueError as error:
+                figura, mensaje = figura_vacia(), str(error)
+            except duckdb.Error:
+                logger.exception("No se pudo consultar el gráfico %s", numero)
+                figura, mensaje = figura_vacia(), "La base no está disponible. Reiniciá el dashboard para reintentar."
+            resultado = [figura, mensaje]
+            if numero == 6:
+                resultado.append({"height": f"{altura}px"})
+            return resultado
+
+    registrar_grafico(3, "mapa", "temporal", ["mapa-categoria"])
+    registrar_grafico(4, "lineas", "totales", ["lineas-dias", "lineas-validaciones"])
+    registrar_grafico(5, "categorias", "totales", ["categorias-dias", "categorias-validaciones"])
+    registrar_grafico(6, "composicion", "composicion", ["composicion-dias", "composicion-validaciones"])
+    registrar_grafico(7, "comunas", "totales", ["comunas-dias"])
+    registrar_grafico(8, "estaciones", "totales", ["estaciones-dias"])

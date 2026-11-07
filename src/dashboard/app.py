@@ -11,6 +11,7 @@ from src.repositories.generic_repository import GenericRepository
 from src.dashboard.callbacks import registrar_callbacks
 from src.dashboard.layout import crear_layout
 from src.dashboard.queries import obtener_catalogos
+from src.dashboard.peaks import registrar_picos
 
 
 def crear_app(repository=None) -> Dash:
@@ -37,6 +38,7 @@ def crear_app(repository=None) -> Dash:
         return app
     app.layout = crear_layout(catalogos)
     registrar_callbacks(app, repository, catalogos)
+    registrar_picos(app, repository)
     return app
 
 
