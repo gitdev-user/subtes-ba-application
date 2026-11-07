@@ -140,7 +140,7 @@ def crear_layout(catalogos):
                         {"label": "Todos", "value": "todos"}
                     ] + [{"label": label, "value": key} for key, label in VALIDACIONES.items()], "todos")),
                 ], detalle="Ingresos mensuales entre las fechas Desde y Hasta, ambas inclusive. Al limpiar el rango se muestra todo el histórico."),
-                tarjeta(2, "Forma de los picos de ingresos", ancho=True, controles=[
+                tarjeta(2, "Perfil diario de ingresos por categoría de estación", ancho=True, controles=[
                     campo("Año", selector("picos-anio", [
                         {"label": "Todos", "value": "todos"},
                         *[{"label": str(anio), "value": anio} for anio in range(2014, 2022)],
